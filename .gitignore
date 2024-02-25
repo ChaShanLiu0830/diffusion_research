@@ -3,7 +3,11 @@
 
 *.ipynb 
 *.pt 
-
+*.out
+*.tar.gz
+*.sh
+*.npz
+test/data/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

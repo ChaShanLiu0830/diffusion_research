@@ -124,12 +124,6 @@ class PixelNorm(Module):
 # forced weight normed conv2d and linear
 # algorithm 1 in paper
 
-def normalize_weight(weight, eps = 1e-4):
-    weight, ps = pack_one(weight, 'o *')
-    normed_weight = l2norm(weight, eps = eps)
-    normed_weight = normed_weight * sqrt(weight.numel() / weight.shape[0])
-    return unpack_one(normed_weight, ps, 'o *')
-
 class Conv2d(Module):
     def __init__(
         self,
@@ -148,13 +142,14 @@ class Conv2d(Module):
         self.concat_ones_to_input = concat_ones_to_input
 
     def forward(self, x):
-
         if self.training:
             with torch.no_grad():
-                normed_weight = normalize_weight(self.weight, eps = self.eps)
+                weight, ps = pack_one(self.weight, 'o *')
+                normed_weight = l2norm(weight, eps = self.eps)
+                normed_weight = unpack_one(normed_weight, ps, 'o *')
                 self.weight.copy_(normed_weight)
 
-        weight = normalize_weight(self.weight, eps = self.eps) / sqrt(self.fan_in)
+        weight = l2norm(self.weight, eps = self.eps) / sqrt(self.fan_in)
 
         if self.concat_ones_to_input:
             x = F.pad(x, (0, 0, 0, 0, 1, 0), value = 1.)
@@ -172,10 +167,10 @@ class Linear(Module):
     def forward(self, x):
         if self.training:
             with torch.no_grad():
-                normed_weight = normalize_weight(self.weight, eps = self.eps)
+                normed_weight = l2norm(self.weight, eps = self.eps)
                 self.weight.copy_(normed_weight)
 
-        weight = normalize_weight(self.weight, eps = self.eps) / sqrt(self.fan_in)
+        weight = l2norm(self.weight, eps = self.eps) / sqrt(self.fan_in)
         return F.linear(x, weight)
 
 # mp fourier embeds

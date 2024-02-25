@@ -1,11 +1,12 @@
 import math
 import copy
+import numpy as np
 from pathlib import Path
 from random import random
 from functools import partial
 from collections import namedtuple
 from multiprocessing import cpu_count
-
+import matplotlib.pyplot as plt
 import torch
 from torch import nn, einsum
 from torch.cuda.amp import autocast
@@ -816,7 +817,46 @@ class GaussianDiffusion(nn.Module):
 
         img = self.normalize(img)
         return self.p_losses(img, t, *args, **kwargs)
+    
+    # def error_loss(self, img, *args, **kwargs):
+        
+class ErrorDiffusion(GaussianDiffusion):
+    
+    def eff_noise(self, t, noise, model_error):
+        #(betas[1:]/betas[:-1])*(sqrt_one_minus_alphas_cumprod[:-1]/sqrt_one_minus_alphas_cumprod[1:])*(1/(1 - betas[1:]).sqrt())
+        error_eff_coeff  = (self.betas[1:]/self.betas[:-1])*(self.sqrt_one_minus_alphas_cumprod[:-1]/(self.sqrt_one_minus_alphas_cumprod[1:] *(1 - self.betas[1:]).sqrt()))
+        error_eff_coeff = torch.clamp(error_eff_coeff, max = 3)
+        # print(error_eff_coeff.shape)。
+        # error_eff_coeff = 1
+        delta_error = noise - model_error
+        # print(error_eff_coeff[t].shape, noise.shape, delta_error.shape)
+        effective_noise = extract(error_eff_coeff, t, noise.shape)*delta_error + noise
+        return effective_noise
+    
+    def error_losses(self, img, noise = None, offset_noise_strength = None):
+        b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
+        assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
+        t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
+        t[t==0]=1
+        img = self.normalize(img)
+        noise = default(noise, lambda: torch.randn_like(img))
+        offset_noise_strength = default(offset_noise_strength, self.offset_noise_strength)
+        if offset_noise_strength > 0.:
+            offset_noise = torch.randn(img.shape[:2], device = self.device)
+            noise += offset_noise_strength * rearrange(offset_noise, 'b c -> b c 1 1')
+        x = self.q_sample(x_start = img, t = t, noise = noise)
+        model_out = self.model(x, t)
+        eff_noise = self.eff_noise(t-1, noise, model_out.detach_())
+        x_error = self.q_sample(x_start = img, t = t-1, noise = eff_noise)
+        # print(t)
+        model_out_error = self.model(x_error, t-1)
+        # print(model_out_error)
+        loss = F.mse_loss(model_out_error, eff_noise, reduction = 'none')
+        loss = reduce(loss, 'b ... -> b', 'mean')
+        loss = loss * extract(self.loss_weight, t, loss.shape)
+        return loss.mean()
 
+        
 # dataset classes
 
 class Dataset(Dataset):
@@ -857,7 +897,8 @@ class Trainer(object):
     def __init__(
         self,
         diffusion_model,
-        folder,
+        trainset,
+        validset,
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
@@ -867,9 +908,10 @@ class Trainer(object):
         ema_update_every = 10,
         ema_decay = 0.995,
         adam_betas = (0.9, 0.99),
-        save_and_sample_every = 1000,
+        save_and_sample_every = 2000,
         num_samples = 25,
         results_folder = './results',
+        process_folder = "./process",
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
@@ -877,8 +919,10 @@ class Trainer(object):
         calculate_fid = True,
         inception_block_idx = 2048,
         max_grad_norm = 1.,
-        num_fid_samples = 50000,
-        save_best_and_latest_only = False
+        num_fid_samples = 10000,
+        save_best_and_latest_only = False, 
+        train_error = True,
+        eff_rate = 0.1,
     ):
         super().__init__()
 
@@ -914,18 +958,22 @@ class Trainer(object):
         self.image_size = diffusion_model.image_size
 
         self.max_grad_norm = max_grad_norm
-
+        self.train_error = train_error
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        self.trainset = trainset
+        self.validset = validset
+        assert len(self.trainset) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
-        assert len(self.ds) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
+        traindl = DataLoader(self.trainset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        validdl = DataLoader(self.validset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
 
-        dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
-
-        dl = self.accelerator.prepare(dl)
-        self.dl = cycle(dl)
-
+        traindl, validdl = self.accelerator.prepare(traindl, validdl)
+        
+        self.traindl = cycle(traindl)
+        self.validdl = cycle(validdl)
+        
+        self.eff_rate = eff_rate
         # optimizer
 
         self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
@@ -937,7 +985,10 @@ class Trainer(object):
             self.ema.to(self.device)
 
         self.results_folder = Path(results_folder)
+        self.process_folder = Path(process_folder)
         self.results_folder.mkdir(exist_ok = True)
+        self.process_folder.mkdir(exist_ok = True)
+        
 
         # step counter state
 
@@ -959,7 +1010,7 @@ class Trainer(object):
                 )
             self.fid_scorer = FIDEvaluation(
                 batch_size=self.batch_size,
-                dl=self.dl,
+                dl=self.traindl,
                 sampler=self.ema.ema_model,
                 channels=self.channels,
                 accelerator=self.accelerator,
@@ -1017,24 +1068,51 @@ class Trainer(object):
     def train(self):
         accelerator = self.accelerator
         device = accelerator.device
-
+        
+        
         with tqdm(initial = self.step, total = self.train_num_steps, disable = not accelerator.is_main_process) as pbar:
-
+            
+            recode_train_loss = []
+            recode_valid_loss = []
+            recode_error_train_loss = []
+            recode_error_valid_loss = []
+            recode_fid_score = []
+            fid_score_index = []
+            
             while self.step < self.train_num_steps:
 
-                total_loss = 0.
-
+                train_loss = 0.
+                valid_loss = 0.
+                train_error_loss = 0.
+                valid_error_loss = 0.
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
-
+                    train_data = next(self.traindl).to(device)
+                    valid_data = next(self.validdl).to(device)
+                    
                     with self.accelerator.autocast():
-                        loss = self.model(data)
+                        loss = self.model(train_data)
                         loss = loss / self.gradient_accumulate_every
-                        total_loss += loss.item()
-
-                    self.accelerator.backward(loss)
-
-                pbar.set_description(f'loss: {total_loss:.4f}')
+                        train_loss += loss.item()
+                        # if self.train_error:
+                        error_loss =  self.model.error_losses(train_data)
+                        train_error_loss += error_loss.item()
+                    
+                    if self.train_error:
+                        self.accelerator.backward(loss + self.eff_rate*error_loss)
+                    else:
+                        self.accelerator.backward(loss)
+                            
+                    
+                    with torch.no_grad():
+                        loss = self.model(valid_data)
+                        valid_loss += loss.item()
+                        error_loss =  self.model.error_losses(valid_data)
+                        valid_error_loss += error_loss.item()
+                        
+                        
+                          
+                          
+                pbar.set_description(f'loss: {train_loss:.4f}|{train_error_loss:.4f}')
 
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -1043,8 +1121,34 @@ class Trainer(object):
                 self.opt.zero_grad()
 
                 accelerator.wait_for_everyone()
-
+                
+                recode_train_loss.append(train_loss)
+                recode_valid_loss.append(valid_loss)
+                recode_error_train_loss.append(train_error_loss)
+                recode_error_valid_loss.append(valid_error_loss)
+                
                 self.step += 1
+                if (self.step % 10 == 0) or (self.step == self.train_num_steps):
+                    fig, ax = plt.subplots(2,1, figsize = (10,8))
+                    ax[0].plot(np.arange(0, self.step), recode_train_loss, label = "train")
+                    ax[0].plot(np.arange(0, self.step), recode_valid_loss, label = "valid")
+                    ax[1].plot(np.arange(0, self.step), recode_error_train_loss, label = "train")
+                    ax[1].plot(np.arange(0, self.step), recode_error_valid_loss, label = "valid")
+                    ax[0].legend()
+                    ax[0].grid()
+                    ax[1].legend()
+                    ax[1].grid()
+                    ax[0].set_xlabel("step")
+                    ax[0].set_ylabel("loss")
+                    ax[1].set_xlabel("step")
+                    ax[1].set_ylabel("loss")
+                    ax[0].set_title("gaussian noise")
+                    ax[1].set_title("effective noise")
+                    plt.tight_layout()
+                    plt.savefig(f"./process/process" + [f"_error_{self.eff_rate}" if self.train_error else ""][0] + ".png")
+                    plt.close()
+                    
+                
                 if accelerator.is_main_process:
                     self.ema.update()
 
@@ -1058,12 +1162,25 @@ class Trainer(object):
 
                         all_images = torch.cat(all_images_list, dim = 0)
 
-                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
+                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}_{self.train_error}.png'), nrow = int(math.sqrt(self.num_samples)))
 
                         # whether to calculate fid
 
                         if self.calculate_fid:
+                            # fig, ax = plt.subplots(1,1, figsize = (10,8))
                             fid_score = self.fid_scorer.fid_score()
+                            fid_score_index.append(self.step)
+                            recode_fid_score.append(fid_score)
+                            fig, ax = plt.subplots(1,1, figsize = (10,8))
+                            ax.plot(fid_score_index, recode_fid_score, label = "fid_score")
+                            ax.scatter(fid_score_index, recode_fid_score, s = 1)
+                            ax.legend()
+                            ax.grid()
+                            ax.set_xlabel("step")
+                            ax.set_ylabel("fid")
+                            plt.tight_layout()
+                            plt.savefig(f"./process/fid" + [f"_error_{self.eff_rate}" if self.train_error else ""][0] + ".png")
+                            plt.close()
                             accelerator.print(f'fid_score: {fid_score}')
                         if self.save_best_and_latest_only:
                             if self.best_fid > fid_score:
