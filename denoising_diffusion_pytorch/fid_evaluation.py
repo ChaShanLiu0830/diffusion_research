@@ -31,6 +31,7 @@ class FIDEvaluation:
         device="cuda",
         num_fid_samples=50000,
         inception_block_idx=2048,
+        wandb_run = None
     ):
         self.batch_size = batch_size
         self.n_samples = num_fid_samples
@@ -44,6 +45,7 @@ class FIDEvaluation:
         block_idx = InceptionV3.BLOCK_INDEX_BY_DIM[inception_block_idx]
         self.inception_v3 = InceptionV3([block_idx]).to(device)
         self.dataset_stats_loaded = False
+        self.wandb_run = wandb_run
 
     def calculate_inception_features(self, samples):
         if self.channels == 1:

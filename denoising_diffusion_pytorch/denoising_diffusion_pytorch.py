@@ -12,7 +12,10 @@ from torch import nn, einsum
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
+import torchvision.transforms as transforms
+from torchvision.utils import make_grid
+import wandb
+# import numpy as np 
 from torch.optim import Adam
 
 from torchvision import transforms as T, utils
@@ -668,10 +671,10 @@ class GaussianDiffusion(nn.Module):
         return pred_img, x_start
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, return_all_timesteps = False):
+    def p_sample_loop(self, shape, return_all_timesteps = False, fix_noise = None):
         batch, device = shape[0], self.device
 
-        img = torch.randn(shape, device = device)
+        img = torch.randn(shape, device = device) if fix_noise is None else fix_noise
         imgs = [img]
 
         x_start = None
@@ -687,14 +690,14 @@ class GaussianDiffusion(nn.Module):
         return ret
 
     @torch.inference_mode()
-    def ddim_sample(self, shape, return_all_timesteps = False):
+    def ddim_sample(self, shape, return_all_timesteps = False, fix_noise = None):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
         times = list(reversed(times.int().tolist()))
         time_pairs = list(zip(times[:-1], times[1:])) # [(T-1, T-2), (T-2, T-3), ..., (1, 0), (0, -1)]
 
-        img = torch.randn(shape, device = device)
+        img = torch.randn(shape, device = device) if fix_noise is None else fix_noise
         imgs = [img]
 
         x_start = None
@@ -729,10 +732,10 @@ class GaussianDiffusion(nn.Module):
         return ret
 
     @torch.inference_mode()
-    def sample(self, batch_size = 16, return_all_timesteps = False):
+    def sample(self, batch_size = 16, return_all_timesteps = False, fix_noise = None):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, image_size, image_size), return_all_timesteps = return_all_timesteps)
+        return sample_fn((batch_size, channels, image_size, image_size), return_all_timesteps = return_all_timesteps, fix_noise = fix_noise)
 
     @torch.inference_mode()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -828,7 +831,7 @@ class ErrorDiffusion(GaussianDiffusion):
         error_eff_coeff = torch.clamp(error_eff_coeff, max = 3)
         # print(error_eff_coeff.shape)。
         # error_eff_coeff = 1
-        delta_error = noise - model_error
+        delta_error = model_error - noise
         # print(error_eff_coeff[t].shape, noise.shape, delta_error.shape)
         effective_noise = extract(error_eff_coeff, t, noise.shape)*delta_error + noise
         return effective_noise
@@ -899,6 +902,7 @@ class Trainer(object):
         diffusion_model,
         trainset,
         validset,
+        testset,
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
@@ -909,7 +913,7 @@ class Trainer(object):
         ema_decay = 0.995,
         adam_betas = (0.9, 0.99),
         save_and_sample_every = 2000,
-        num_samples = 25,
+        num_samples = 100,
         results_folder = './results',
         process_folder = "./process",
         amp = False,
@@ -923,6 +927,8 @@ class Trainer(object):
         save_best_and_latest_only = False, 
         train_error = True,
         eff_rate = 0.1,
+        wandb_run = None,
+        fix_noise = None,
     ):
         super().__init__()
 
@@ -963,17 +969,22 @@ class Trainer(object):
 
         self.trainset = trainset
         self.validset = validset
+        self.testset = testset
         assert len(self.trainset) >= 100, 'you should have at least 100 images in your folder. at least 10k images recommended'
 
         traindl = DataLoader(self.trainset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
         validdl = DataLoader(self.validset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
+        testdl = DataLoader(self.testset, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
 
-        traindl, validdl = self.accelerator.prepare(traindl, validdl)
+        traindl, validdl, testdl = self.accelerator.prepare(traindl, validdl, testdl)
         
         self.traindl = cycle(traindl)
         self.validdl = cycle(validdl)
+        self.testdl = cycle(testdl)
+
         
         self.eff_rate = eff_rate
+        self.wandb_run = wandb_run
         # optimizer
 
         self.opt = Adam(diffusion_model.parameters(), lr = train_lr, betas = adam_betas)
@@ -993,7 +1004,8 @@ class Trainer(object):
         # step counter state
 
         self.step = 0
-
+        self.fix_noise = self.accelerator.prepare(torch.randn((self.num_samples,3,32,32)) if fix_noise is None else fix_noise )#Hard Code
+        self.fix_noise = self.fix_noise.to("cuda:0")
         # prepare model, dataloader, optimizer with accelerator
 
         self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
@@ -1010,14 +1022,15 @@ class Trainer(object):
                 )
             self.fid_scorer = FIDEvaluation(
                 batch_size=self.batch_size,
-                dl=self.traindl,
+                dl=self.testdl,
                 sampler=self.ema.ema_model,
                 channels=self.channels,
                 accelerator=self.accelerator,
                 stats_dir=results_folder,
                 device=self.device,
                 num_fid_samples=num_fid_samples,
-                inception_block_idx=inception_block_idx
+                inception_block_idx=inception_block_idx,
+                wandb_run= self.wandb_run
             )
 
         if save_best_and_latest_only:
@@ -1043,13 +1056,13 @@ class Trainer(object):
             'version': __version__
         }
 
-        torch.save(data, str(self.results_folder / f'model-{milestone}.pt'))
+        torch.save(data, str(self.results_folder / f'model-{milestone}_error{self.train_error}_{self.eff_rate}.pt'))
 
     def load(self, milestone):
         accelerator = self.accelerator
         device = accelerator.device
 
-        data = torch.load(str(self.results_folder / f'model-{milestone}.pt'), map_location=device)
+        data = torch.load(str(self.results_folder / f'model-{milestone}_error{self.train_error}_{self.eff_rate}.pt'), map_location=device)
 
         model = self.accelerator.unwrap_model(self.model)
         model.load_state_dict(data['model'])
@@ -1114,6 +1127,7 @@ class Trainer(object):
                           
                 pbar.set_description(f'loss: {train_loss:.4f}|{train_error_loss:.4f}')
 
+                self.wandb_run.log({"train_loss":train_loss, "train_error_loss":train_error_loss, "valid_loss":valid_loss, "valid_error_loss":valid_error_loss})
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
@@ -1127,61 +1141,54 @@ class Trainer(object):
                 recode_error_train_loss.append(train_error_loss)
                 recode_error_valid_loss.append(valid_error_loss)
                 
-                self.step += 1
-                if (self.step % 10 == 0) or (self.step == self.train_num_steps):
-                    fig, ax = plt.subplots(2,1, figsize = (10,8))
-                    ax[0].plot(np.arange(0, self.step), recode_train_loss, label = "train")
-                    ax[0].plot(np.arange(0, self.step), recode_valid_loss, label = "valid")
-                    ax[1].plot(np.arange(0, self.step), recode_error_train_loss, label = "train")
-                    ax[1].plot(np.arange(0, self.step), recode_error_valid_loss, label = "valid")
-                    ax[0].legend()
-                    ax[0].grid()
-                    ax[1].legend()
-                    ax[1].grid()
-                    ax[0].set_xlabel("step")
-                    ax[0].set_ylabel("loss")
-                    ax[1].set_xlabel("step")
-                    ax[1].set_ylabel("loss")
-                    ax[0].set_title("gaussian noise")
-                    ax[1].set_title("effective noise")
-                    plt.tight_layout()
-                    plt.savefig(f"./process/process" + [f"_error_{self.eff_rate}" if self.train_error else ""][0] + ".png")
-                    plt.close()
-                    
+    
                 
                 if accelerator.is_main_process:
                     self.ema.update()
 
-                    if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
+                    if divisible_by(self.step, self.save_and_sample_every):
                         self.ema.ema_model.eval()
 
                         with torch.inference_mode():
                             milestone = self.step // self.save_and_sample_every
                             batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                            # print(batches)
+                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size = n), batches))
+                            fix_noise_list = list(map(lambda n: self.ema.ema_model.sample(batch_size = n, fix_noise = self.fix_noise), batches))
+
 
                         all_images = torch.cat(all_images_list, dim = 0)
+                        fix_noise_images = torch.cat(fix_noise_list, dim = 0)
 
-                        utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}_{self.train_error}.png'), nrow = int(math.sqrt(self.num_samples)))
+                        # unnormalize = transforms.Normalize((-1, -1, -1), (2, 2, 2))
+                        image = (make_grid(all_images, int(self.num_samples**0.5)).cpu().numpy()*255).astype(np.uint8)
+                        fiximage = (make_grid(fix_noise_images, int(self.num_samples**0.5)).cpu().numpy()*255).astype(np.uint8)
+                        pil_image = Image.fromarray(np.transpose(image, (1, 2, 0)))  # Assuming tensor is in CHW format
+                        pil_image_fix = Image.fromarray(np.transpose(fiximage, (1, 2, 0)))  # Assuming tensor is in CHW format
 
-                        # whether to calculate fid
+                        image = wandb.Image(pil_image, caption=f'sample-{milestone}_{self.train_error}_{self.eff_rate}.png')
+                        image_fix = wandb.Image(pil_image_fix, caption=f'sample-{milestone}_{self.train_error}_{self.eff_rate}.png')
 
+                        self.wandb_run.log({"random_sample": image, "fix_noise": image_fix})
+                        
+                    if (divisible_by(self.step, 10000)) & (self.step != 0):
                         if self.calculate_fid:
                             # fig, ax = plt.subplots(1,1, figsize = (10,8))
                             fid_score = self.fid_scorer.fid_score()
-                            fid_score_index.append(self.step)
-                            recode_fid_score.append(fid_score)
-                            fig, ax = plt.subplots(1,1, figsize = (10,8))
-                            ax.plot(fid_score_index, recode_fid_score, label = "fid_score")
-                            ax.scatter(fid_score_index, recode_fid_score, s = 1)
-                            ax.legend()
-                            ax.grid()
-                            ax.set_xlabel("step")
-                            ax.set_ylabel("fid")
-                            plt.tight_layout()
-                            plt.savefig(f"./process/fid" + [f"_error_{self.eff_rate}" if self.train_error else ""][0] + ".png")
-                            plt.close()
-                            accelerator.print(f'fid_score: {fid_score}')
+                            # fid_score_index.append(self.step)
+                            # recode_fid_score.append(fid_score)
+                            # fig, ax = plt.subplots(1,1, figsize = (10,8))
+                            # ax.plot(fid_score_index, recode_fid_score, label = "fid_score")
+                            # ax.scatter(fid_score_index, recode_fid_score, s = 1)
+                            # ax.legend()
+                            # ax.grid()
+                            # ax.set_xlabel("step")
+                            # ax.set_ylabel("fid")
+                            # plt.tight_layout()
+                            # plt.savefig(f"./process/fid" + [f"_error_{self.eff_rate}" if self.train_error else ""][0] + ".png")
+                            # plt.close()
+                            self.wandb_run.log({"fid_score": fid_score})
+                            # accelerator.print(f'fid_score: {fid_score}')
                         if self.save_best_and_latest_only:
                             if self.best_fid > fid_score:
                                 self.best_fid = fid_score
@@ -1189,7 +1196,7 @@ class Trainer(object):
                             self.save("latest")
                         else:
                             self.save(milestone)
-
+                    self.step += 1
                 pbar.update(1)
 
         accelerator.print('training complete')
